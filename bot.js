@@ -1,15 +1,22 @@
+
 const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 const { Pool } = require("pg");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "");
+const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "").trim();
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-if (!TOKEN || !ADMIN_ID || !DATABASE_URL) {
-  throw new Error("Missing environment variables");
-}
+console.log("========== ENV CHECK ==========");
+console.log("TELEGRAM_BOT_TOKEN:", TOKEN ? "OK" : "MISSING");
+console.log("ADMIN_CHAT_ID:", ADMIN_ID ? "OK" : "MISSING");
+console.log("DATABASE_URL:", DATABASE_URL ? "OK" : "MISSING");
+console.log("================================");
+
+if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+if (!ADMIN_ID) throw new Error("Missing ADMIN_CHAT_ID");
+if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 const app = express();
@@ -98,7 +105,7 @@ async function getPrice(code) {
     "SELECT price FROM products WHERE code = $1",
     [code]
   );
-  return result.rows[0]?.price || "برای استعلام تماس بگیرید";
+  return result.rows[0]?.price || "برای استعلام قیمت پیام بدهید";
 }
 
 async function getCard() {
@@ -128,7 +135,8 @@ bot.onText(/\/admin/, async (msg) => {
   }
 
   states.delete(msg.from.id);
-  bot.sendMessage(
+
+  return bot.sendMessage(
     msg.chat.id,
     "⚙️ پنل مدیریت SHOP_UFO",
     adminMenu
@@ -169,6 +177,7 @@ bot.on("callback_query", async (query) => {
 
     if (data === "support") {
       states.set(userId, { type: "support" });
+
       return bot.sendMessage(
         chatId,
         "📞 پیام خودت رو برای پشتیبانی بنویس."
@@ -222,6 +231,7 @@ bot.on("callback_query", async (query) => {
 
     if (data.startsWith("approve_") && isAdmin(userId)) {
       const id = Number(data.split("_")[1]);
+
       const result = await db.query(
         "UPDATE orders SET status = 'completed' WHERE id = $1 AND status = 'awaiting_admin' RETURNING *",
         [id]
@@ -241,6 +251,7 @@ bot.on("callback_query", async (query) => {
 
     if (data.startsWith("reject_") && isAdmin(userId)) {
       const id = Number(data.split("_")[1]);
+
       const result = await db.query(
         "UPDATE orders SET status = 'rejected' WHERE id = $1 AND status = 'awaiting_admin' RETURNING *",
         [id]
@@ -258,7 +269,7 @@ bot.on("callback_query", async (query) => {
       return bot.sendMessage(chatId, `❌ سفارش #${id} رد شد.`);
     }
   } catch (error) {
-    console.error(error);
+    console.error("Callback error:", error.message);
     bot.sendMessage(chatId, "خطایی رخ داد. دوباره تلاش کن.");
   }
 });
@@ -317,13 +328,7 @@ bot.on("message", async (msg) => {
          (user_id, username, product, details, price)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING id`,
-        [
-          userId,
-          msg.from.username || "",
-          title,
-          msg.text,
-          price
-        ]
+        [userId, msg.from.username || "", title, msg.text, price]
       );
 
       const orderId = result.rows[0].id;
@@ -364,6 +369,7 @@ bot.on("message", async (msg) => {
       }
 
       const order = result.rows[0];
+
       const keyboard = {
         reply_markup: {
           inline_keyboard: [[
@@ -390,6 +396,7 @@ bot.on("message", async (msg) => {
       }
 
       states.delete(userId);
+
       return bot.sendMessage(
         userId,
         "✅ رسید دریافت شد.\nسفارش در انتظار بررسی مدیریت است."
@@ -397,18 +404,23 @@ bot.on("message", async (msg) => {
     }
 
     if (state.type === "support") {
-      const text = msg.text || "مشتری یک فایل یا رسانه فرستاده است.";
+      const messageText = msg.text || "مشتری یک فایل یا رسانه فرستاده است.";
 
       await bot.sendMessage(
         ADMIN_ID,
-        `📞 پیام پشتیبانی\nمشتری: ${userId}\nنام کاربری: @${msg.from.username || "ندارد"}\n\n${text}`
+        `📞 پیام پشتیبانی\nمشتری: ${userId}\nنام کاربری: @${msg.from.username || "ندارد"}\n\n${messageText}`
       );
 
       states.delete(userId);
-      return bot.sendMessage(userId, "✅ پیام تو برای پشتیبانی ارسال شد.", mainMenu);
+
+      return bot.sendMessage(
+        userId,
+        "✅ پیام تو برای پشتیبانی ارسال شد.",
+        mainMenu
+      );
     }
   } catch (error) {
-    console.error(error);
+    console.error("Message error:", error.message);
     bot.sendMessage(userId, "خطایی رخ داد. لطفاً دوباره تلاش کن.");
   }
 });
@@ -417,17 +429,29 @@ app.get("/", (req, res) => {
   res.send("SHOP_UFO Bot is running!");
 });
 
+app.get("/health", (req, res) => {
+  res.send("OK");
+});
+
 bot.on("polling_error", (error) => {
   console.error("Telegram polling error:", error.message);
 });
 
-initDatabase()
-  .then(() => {
+async function start() {
+  try {
+    await initDatabase();
+
+    await bot.getMe();
+
+    console.log("Telegram bot connected successfully");
+
     app.listen(PORT, () => {
       console.log("SHOP_UFO server is running on port " + PORT);
     });
-  })
-  .catch((error) => {
-    console.error("Database connection failed:", error);
+  } catch (error) {
+    console.error("Startup failed:", error.message);
     process.exit(1);
-  });
+  }
+}
+
+start();
