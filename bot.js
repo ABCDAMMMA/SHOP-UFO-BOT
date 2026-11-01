@@ -1,67 +1,45 @@
 
 const TelegramBot = require("node-telegram-bot-api");
-const express = require("express");
 const { Pool } = require("pg");
+const express = require("express");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "").trim();
-const PORT = process.env.PORT || 3000;
+const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "");
 const DATABASE_URL = process.env.DATABASE_URL;
 
-console.log("========== ENV CHECK ==========");
-console.log("TELEGRAM_BOT_TOKEN:", TOKEN ? "OK" : "MISSING");
-console.log("ADMIN_CHAT_ID:", ADMIN_ID ? "OK" : "MISSING");
-console.log("DATABASE_URL:", DATABASE_URL ? "OK" : "MISSING");
-console.log("================================");
-
-if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
-if (!ADMIN_ID) throw new Error("Missing ADMIN_CHAT_ID");
-if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
+if (!TOKEN || !ADMIN_ID || !DATABASE_URL) {
+  throw new Error("Missing environment variables");
+}
 
 const bot = new TelegramBot(TOKEN, { polling: true });
-const app = express();
-
 const db = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-const states = new Map();
+const app = express();
+app.get("/", (_, res) => res.send("SHOP_UFO is running"));
+app.get("/health", (_, res) => res.send("OK"));
 
-const products = {
-  stars: "⭐ استارز تلگرام",
-  gifts: "🎁 گیفت تلگرام",
-  services: "🛍 سایر خدمات مجازی"
-};
-
-const mainMenu = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: "⭐ خرید استارز", callback_data: "buy_stars" }],
-      [{ text: "🎁 خرید گیفت", callback_data: "buy_gifts" }],
-      [{ text: "🛍 سایر خدمات", callback_data: "buy_services" }],
-      [{ text: "📞 پشتیبانی", callback_data: "support" }]
-    ]
-  }
-};
-
-const adminMenu = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: "💰 تغییر قیمت محصولات", callback_data: "edit_prices" }],
-      [{ text: "💳 تغییر شماره کارت", callback_data: "edit_card" }],
-      [{ text: "📦 سفارش‌های اخیر", callback_data: "orders" }],
-      [{ text: "🏠 منوی اصلی", callback_data: "home" }]
-    ]
-  }
-};
-
-async function initDatabase() {
+async function initDB() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS products (
-      code TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      price TEXT NOT NULL
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      price BIGINT NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT TRUE
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      product_id INTEGER REFERENCES products(id),
+      product_name TEXT NOT NULL,
+      price BIGINT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_payment',
+      receipt_file_id TEXT,
+      delivery TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -69,389 +47,331 @@ async function initDatabase() {
       value TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS orders (
-      id SERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      username TEXT,
-      product TEXT NOT NULL,
-      details TEXT NOT NULL,
-      price TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'awaiting_receipt',
-      receipt TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      user_id BIGINT PRIMARY KEY,
+      action TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT '{}'
     );
   `);
 
-  for (const [code, title] of Object.entries(products)) {
+  for (const name of ["تلگرام استارز", "گیفت تلگرام", "سایر خدمات مجازی"]) {
     await db.query(
-      `INSERT INTO products (code, title, price)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (code) DO NOTHING`,
-      [code, title, "برای استعلام قیمت پیام بدهید"]
+      `INSERT INTO products(name,price)
+       SELECT $1,0
+       WHERE NOT EXISTS (SELECT 1 FROM products WHERE name=$1)`,
+      [name]
     );
   }
+}
 
+async function sessionSet(id, action, data = {}) {
   await db.query(
-    `INSERT INTO settings (key, value)
-     VALUES ('card', 'شماره کارت هنوز تنظیم نشده')
-     ON CONFLICT (key) DO NOTHING`
+    `INSERT INTO user_sessions(user_id,action,data)
+     VALUES($1,$2,$3)
+     ON CONFLICT(user_id)
+     DO UPDATE SET action=$2,data=$3`,
+    [id, action, JSON.stringify(data)]
   );
-
-  console.log("SHOP_UFO database connected");
 }
 
-async function getPrice(code) {
-  const result = await db.query(
-    "SELECT price FROM products WHERE code = $1",
-    [code]
+async function sessionGet(id) {
+  const r = await db.query(
+    "SELECT action,data FROM user_sessions WHERE user_id=$1",
+    [id]
   );
-  return result.rows[0]?.price || "برای استعلام قیمت پیام بدهید";
+  return r.rows[0] || null;
 }
 
-async function getCard() {
-  const result = await db.query(
-    "SELECT value FROM settings WHERE key = 'card'"
-  );
-  return result.rows[0]?.value || "شماره کارت تنظیم نشده";
+async function sessionClear(id) {
+  await db.query("DELETE FROM user_sessions WHERE user_id=$1", [id]);
 }
 
-function isAdmin(userId) {
-  return String(userId) === ADMIN_ID;
+function admin(id) {
+  return String(id) === ADMIN_ID;
 }
 
-bot.onText(/\/start/, async (msg) => {
-  states.delete(msg.from.id);
+function menu(id) {
+  const rows = [
+    [{ text: "🛍 خدمات فروشگاه", callback_data: "products" }],
+    [{ text: "📦 سفارش‌های من", callback_data: "orders" }],
+    [{ text: "💬 پشتیبانی", callback_data: "support" }]
+  ];
 
-  await bot.sendMessage(
-    msg.chat.id,
-    "🛸 به فروشگاه SHOP_UFO خوش آمدی!\n\nخدمات موردنظرت رو انتخاب کن:",
-    mainMenu
-  );
-});
-
-bot.onText(/\/admin/, async (msg) => {
-  if (!isAdmin(msg.from.id)) {
-    return bot.sendMessage(msg.chat.id, "⛔ دسترسی غیرمجاز");
+  if (admin(id)) {
+    rows.push([{ text: "⚙️ مدیریت", callback_data: "admin" }]);
   }
 
-  states.delete(msg.from.id);
+  return { inline_keyboard: rows };
+}
 
-  return bot.sendMessage(
+bot.onText(/^\/start$/, async msg => {
+  await sessionClear(msg.from.id);
+  await bot.sendMessage(
     msg.chat.id,
-    "⚙️ پنل مدیریت SHOP_UFO",
-    adminMenu
+    "🛸 به فروشگاه SHOP_UFO خوش آمدید.",
+    { reply_markup: menu(msg.from.id) }
   );
 });
 
-bot.onText(/\/cancel/, (msg) => {
-  states.delete(msg.from.id);
-  bot.sendMessage(msg.chat.id, "عملیات لغو شد.", mainMenu);
+bot.onText(/^\/cancel$/, async msg => {
+  await sessionClear(msg.from.id);
+  await bot.sendMessage(msg.chat.id, "عملیات لغو شد.");
 });
 
-bot.on("callback_query", async (query) => {
-  const chatId = query.message.chat.id;
-  const userId = query.from.id;
-  const data = query.data;
+bot.on("callback_query", async q => {
+  const id = q.from.id;
+  const chat = q.message.chat.id;
+  const d = q.data;
 
-  await bot.answerCallbackQuery(query.id);
+  await bot.answerCallbackQuery(q.id).catch(() => {});
 
   try {
-    if (data === "home") {
-      states.delete(userId);
-      return bot.sendMessage(chatId, "منوی اصلی:", mainMenu);
-    }
-
-    if (data.startsWith("buy_")) {
-      const code = data.replace("buy_", "");
-      const title = products[code];
-
-      if (!title) return;
-
-      states.set(userId, { type: "order", code });
-
-      return bot.sendMessage(
-        chatId,
-        `🛍 محصول: ${title}\n\nلطفاً مقدار و جزئیات سفارش خودت رو بنویس.\n\nبرای لغو /cancel رو بفرست.`
+    if (d === "products") {
+      const r = await db.query(
+        "SELECT * FROM products WHERE active=true ORDER BY id"
       );
-    }
 
-    if (data === "support") {
-      states.set(userId, { type: "support" });
+      if (!r.rows.length) return bot.sendMessage(chat, "محصولی موجود نیست.");
 
-      return bot.sendMessage(
-        chatId,
-        "📞 پیام خودت رو برای پشتیبانی بنویس."
-      );
-    }
-
-    if (data === "edit_prices" && isAdmin(userId)) {
-      const keyboard = Object.entries(products).map(([code, title]) => [
-        { text: title, callback_data: "price_" + code }
-      ]);
-
-      return bot.sendMessage(chatId, "محصول موردنظر رو انتخاب کن:", {
-        reply_markup: { inline_keyboard: keyboard }
+      return bot.sendMessage(chat, "خدمات فروشگاه:", {
+        reply_markup: {
+          inline_keyboard: r.rows.map(p => [{
+            text: `${p.name} | ${Number(p.price).toLocaleString("en-US")} تومان`,
+            callback_data: `buy_${p.id}`
+          }])
+        }
       });
     }
 
-    if (data.startsWith("price_") && isAdmin(userId)) {
-      const code = data.replace("price_", "");
-      if (!products[code]) return;
+    if (d.startsWith("buy_")) {
+      const pid = Number(d.slice(4));
+      const r = await db.query(
+        "SELECT * FROM products WHERE id=$1 AND active=true", [pid]
+      );
 
-      states.set(userId, { type: "set_price", code });
+      if (!r.rows.length) return bot.sendMessage(chat, "محصول پیدا نشد.");
+
+      const p = r.rows[0];
+      if (Number(p.price) <= 0) {
+        return bot.sendMessage(chat, "قیمت این محصول هنوز تنظیم نشده است.");
+      }
+
+      const order = await db.query(
+        `INSERT INTO orders(user_id,product_id,product_name,price)
+         VALUES($1,$2,$3,$4) RETURNING id`,
+        [id, p.id, p.name, p.price]
+      );
+
+      await sessionSet(id, "receipt", { orderId: order.rows[0].id });
+
+      const card = await db.query(
+        "SELECT value FROM settings WHERE key='card_number'"
+      );
 
       return bot.sendMessage(
-        chatId,
-        `قیمت جدید برای ${products[code]} رو بفرست.\nمثلاً: ۱۰۰ هزار تومان`
+        chat,
+        `سفارش #${order.rows[0].id}\nمحصول: ${p.name}\nمبلغ: ${Number(p.price).toLocaleString("en-US")} تومان\nشماره کارت:\n${card.rows[0]?.value || "تنظیم نشده"}\n\nپس از پرداخت تصویر رسید را ارسال کنید.`
       );
     }
 
-    if (data === "edit_card" && isAdmin(userId)) {
-      states.set(userId, { type: "set_card" });
-      return bot.sendMessage(chatId, "شماره کارت جدید رو ارسال کن.");
-    }
-
-    if (data === "orders" && isAdmin(userId)) {
-      const result = await db.query(
-        "SELECT * FROM orders ORDER BY id DESC LIMIT 10"
-      );
-
-      if (!result.rows.length) {
-        return bot.sendMessage(chatId, "هنوز سفارشی ثبت نشده است.");
-      }
-
-      for (const order of result.rows) {
-        await bot.sendMessage(
-          chatId,
-          `📦 سفارش #${order.id}\nمحصول: ${order.product}\nجزئیات: ${order.details}\nمبلغ: ${order.price}\nوضعیت: ${order.status}`
-        );
-      }
-      return;
-    }
-
-    if (data.startsWith("approve_") && isAdmin(userId)) {
-      const id = Number(data.split("_")[1]);
-
-      const result = await db.query(
-        "UPDATE orders SET status = 'completed' WHERE id = $1 AND status = 'awaiting_admin' RETURNING *",
+    if (d === "orders") {
+      const r = await db.query(
+        "SELECT * FROM orders WHERE user_id=$1 ORDER BY id DESC LIMIT 10",
         [id]
       );
 
-      if (!result.rows.length) {
-        return bot.sendMessage(chatId, "این سفارش قابل تأیید نیست.");
-      }
+      if (!r.rows.length) return bot.sendMessage(chat, "هنوز سفارشی ندارید.");
 
-      await bot.sendMessage(
-        result.rows[0].user_id,
-        `✅ پرداخت سفارش #${id} تأیید شد.\nسفارش شما تکمیل شد.`
-      );
-
-      return bot.sendMessage(chatId, `✅ سفارش #${id} تکمیل شد.`);
-    }
-
-    if (data.startsWith("reject_") && isAdmin(userId)) {
-      const id = Number(data.split("_")[1]);
-
-      const result = await db.query(
-        "UPDATE orders SET status = 'rejected' WHERE id = $1 AND status = 'awaiting_admin' RETURNING *",
-        [id]
-      );
-
-      if (!result.rows.length) {
-        return bot.sendMessage(chatId, "این سفارش قابل رد نیست.");
-      }
-
-      await bot.sendMessage(
-        result.rows[0].user_id,
-        `❌ پرداخت سفارش #${id} تأیید نشد.\nبرای پیگیری با پشتیبانی تماس بگیر.`
-      );
-
-      return bot.sendMessage(chatId, `❌ سفارش #${id} رد شد.`);
-    }
-  } catch (error) {
-    console.error("Callback error:", error.message);
-    bot.sendMessage(chatId, "خطایی رخ داد. دوباره تلاش کن.");
-  }
-});
-
-bot.on("message", async (msg) => {
-  if (!msg.from || msg.from.is_bot) return;
-  if (msg.text && msg.text.startsWith("/")) return;
-
-  const userId = msg.from.id;
-  const state = states.get(userId);
-
-  if (!state) return;
-
-  try {
-    if (state.type === "set_price" && isAdmin(userId)) {
-      if (!msg.text) {
-        return bot.sendMessage(userId, "لطفاً قیمت را به صورت متن بفرست.");
-      }
-
-      await db.query(
-        "UPDATE products SET price = $1 WHERE code = $2",
-        [msg.text, state.code]
-      );
-
-      states.delete(userId);
-      return bot.sendMessage(userId, "✅ قیمت با موفقیت تغییر کرد.", adminMenu);
-    }
-
-    if (state.type === "set_card" && isAdmin(userId)) {
-      if (!msg.text) {
-        return bot.sendMessage(userId, "شماره کارت را به صورت متن بفرست.");
-      }
-
-      await db.query(
-        `INSERT INTO settings (key, value)
-         VALUES ('card', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [msg.text]
-      );
-
-      states.delete(userId);
-      return bot.sendMessage(userId, "✅ شماره کارت ذخیره شد.", adminMenu);
-    }
-
-    if (state.type === "order") {
-      if (!msg.text) {
-        return bot.sendMessage(userId, "لطفاً جزئیات سفارش را به صورت متن بفرست.");
-      }
-
-      const price = await getPrice(state.code);
-      const title = products[state.code];
-      const card = await getCard();
-
-      const result = await db.query(
-        `INSERT INTO orders
-         (user_id, username, product, details, price)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id`,
-        [userId, msg.from.username || "", title, msg.text, price]
-      );
-
-      const orderId = result.rows[0].id;
-      states.set(userId, { type: "receipt", orderId });
-
-      await bot.sendMessage(
-        userId,
-        `🧾 سفارش #${orderId} ثبت شد.\n\nمحصول: ${title}\nجزئیات: ${msg.text}\nمبلغ: ${price}\n\n💳 شماره کارت:\n${card}\n\nپس از پرداخت، تصویر رسید یا کد پیگیری را همین‌جا ارسال کن.\n\n⚠️ پرداخت فقط پس از بررسی مدیریت تأیید می‌شود.`
-      );
-
-      await bot.sendMessage(
-        ADMIN_ID,
-        `🛍 سفارش جدید #${orderId}\nمحصول: ${title}\nمشتری: ${msg.from.username ? "@" + msg.from.username : "بدون نام کاربری"}\nجزئیات: ${msg.text}\nمبلغ: ${price}\nوضعیت: در انتظار رسید`
-      );
-
-      return;
-    }
-
-    if (state.type === "receipt") {
-      const receipt = msg.photo
-        ? msg.photo[msg.photo.length - 1].file_id
-        : msg.text;
-
-      if (!receipt) {
-        return bot.sendMessage(userId, "لطفاً تصویر رسید یا کد پیگیری را بفرست.");
-      }
-
-      const result = await db.query(
-        `UPDATE orders SET receipt = $1, status = 'awaiting_admin'
-         WHERE id = $2 AND user_id = $3
-         RETURNING *`,
-        [receipt, state.orderId, userId]
-      );
-
-      if (!result.rows.length) {
-        states.delete(userId);
-        return bot.sendMessage(userId, "سفارش پیدا نشد. لطفاً با پشتیبانی تماس بگیر.");
-      }
-
-      const order = result.rows[0];
-
-      const keyboard = {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "✅ تأیید پرداخت", callback_data: "approve_" + order.id },
-            { text: "❌ رد پرداخت", callback_data: "reject_" + order.id }
-          ]]
-        }
+      const status = {
+        pending_payment: "در انتظار رسید",
+        receipt_submitted: "در انتظار بررسی رسید",
+        awaiting_delivery: "در انتظار تحویل",
+        completed: "تکمیل شده",
+        rejected: "رد شده"
       };
 
-      const caption =
-        `🧾 رسید سفارش #${order.id}\nمحصول: ${order.product}\nمشتری: ${userId}\nمبلغ: ${order.price}`;
+      return bot.sendMessage(chat, r.rows.map(o =>
+        `#${o.id} | ${o.product_name}\n${status[o.status] || o.status}`
+      ).join("\n\n"));
+    }
 
-      if (msg.photo) {
-        await bot.sendPhoto(ADMIN_ID, receipt, {
-          caption,
-          ...keyboard
-        });
-      } else {
-        await bot.sendMessage(
-          ADMIN_ID,
-          caption + "\nکد پیگیری: " + receipt,
-          keyboard
-        );
-      }
+    if (d === "support") {
+      return bot.sendMessage(chat, "برای پشتیبانی با مدیریت فروشگاه تماس بگیرید.");
+    }
 
-      states.delete(userId);
+    if (d === "admin" && admin(id)) {
+      return bot.sendMessage(chat, "پنل مدیریت SHOP_UFO", {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📊 آمار", callback_data: "stats" }],
+            [{ text: "💳 شماره کارت", callback_data: "card" }],
+            [{ text: "💰 قیمت محصولات", callback_data: "prices" }]
+          ]
+        }
+      });
+    }
 
+    if (d === "stats" && admin(id)) {
+      const r = await db.query(
+        "SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='completed') completed FROM orders"
+      );
       return bot.sendMessage(
-        userId,
-        "✅ رسید دریافت شد.\nسفارش در انتظار بررسی مدیریت است."
+        chat,
+        `کل سفارش‌ها: ${r.rows[0].total}\nتکمیل‌شده: ${r.rows[0].completed}`
       );
     }
 
-    if (state.type === "support") {
-      const messageText = msg.text || "مشتری یک فایل یا رسانه فرستاده است.";
-
-      await bot.sendMessage(
-        ADMIN_ID,
-        `📞 پیام پشتیبانی\nمشتری: ${userId}\nنام کاربری: @${msg.from.username || "ندارد"}\n\n${messageText}`
-      );
-
-      states.delete(userId);
-
-      return bot.sendMessage(
-        userId,
-        "✅ پیام تو برای پشتیبانی ارسال شد.",
-        mainMenu
-      );
+    if (d === "card" && admin(id)) {
+      await sessionSet(id, "setcard");
+      return bot.sendMessage(chat, "شماره کارت ۱۶ رقمی را بفرستید.");
     }
-  } catch (error) {
-    console.error("Message error:", error.message);
-    bot.sendMessage(userId, "خطایی رخ داد. لطفاً دوباره تلاش کن.");
+
+    if (d === "prices" && admin(id)) {
+      const r = await db.query("SELECT * FROM products ORDER BY id");
+      return bot.sendMessage(chat, "محصول را انتخاب کنید:", {
+        reply_markup: {
+          inline_keyboard: r.rows.map(p => [{
+            text: p.name,
+            callback_data: `price_${p.id}`
+          }])
+        }
+      });
+    }
+
+    if (d.startsWith("price_") && admin(id)) {
+      await sessionSet(id, "setprice", { productId: Number(d.slice(6)) });
+      return bot.sendMessage(chat, "قیمت جدید را به تومان وارد کنید.");
+    }
+
+    if (d.startsWith("approve_") && admin(id)) {
+      const oid = Number(d.slice(8));
+      const r = await db.query(
+        `UPDATE orders SET status='awaiting_delivery'
+         WHERE id=$1 AND status='receipt_submitted' RETURNING user_id`,
+        [oid]
+      );
+
+      if (!r.rows.length) return bot.sendMessage(chat, "این سفارش قبلاً بررسی شده است.");
+
+      await sessionSet(id, "delivery", { orderId: oid });
+      await bot.sendMessage(r.rows[0].user_id, "پرداخت تأیید شد؛ سفارش در حال آماده‌سازی است.");
+      return bot.sendMessage(chat, "متن اطلاعات تحویل را ارسال کنید.");
+    }
+
+    if (d.startsWith("reject_") && admin(id)) {
+      const oid = Number(d.slice(7));
+      const r = await db.query(
+        `UPDATE orders SET status='rejected'
+         WHERE id=$1 AND status='receipt_submitted' RETURNING user_id`,
+        [oid]
+      );
+
+      if (!r.rows.length) return bot.sendMessage(chat, "این سفارش قبلاً بررسی شده است.");
+
+      await bot.sendMessage(r.rows[0].user_id, "رسید پرداخت تأیید نشد. برای پشتیبانی پیام دهید.");
+      return bot.sendMessage(chat, "سفارش رد شد.");
+    }
+  } catch (e) {
+    console.error(e);
+    await bot.sendMessage(chat, "خطایی رخ داد.");
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("SHOP_UFO Bot is running!");
-});
-
-app.get("/health", (req, res) => {
-  res.send("OK");
-});
-
-bot.on("polling_error", (error) => {
-  console.error("Telegram polling error:", error.message);
-});
-
-async function start() {
+bot.on("photo", async msg => {
   try {
-    await initDatabase();
+    const s = await sessionGet(msg.from.id);
+    if (!s || s.action !== "receipt") return;
 
-    await bot.getMe();
+    const oid = s.data.orderId;
+    const photo = msg.photo[msg.photo.length - 1];
 
-    console.log("Telegram bot connected successfully");
+    const r = await db.query(
+      `UPDATE orders SET receipt_file_id=$1,status='receipt_submitted'
+       WHERE id=$2 AND user_id=$3 AND status='pending_payment'
+       RETURNING *`,
+      [photo.file_id, oid, msg.from.id]
+    );
 
-    app.listen(PORT, () => {
-      console.log("SHOP_UFO server is running on port " + PORT);
+    await sessionClear(msg.from.id);
+    if (!r.rows.length) return bot.sendMessage(msg.chat.id, "سفارش در انتظار رسید نیست.");
+
+    await bot.sendMessage(msg.chat.id, "رسید دریافت شد و برای بررسی ارسال شد.");
+
+    await bot.sendPhoto(ADMIN_ID, photo.file_id, {
+      caption: `رسید سفارش #${oid}\nمحصول: ${r.rows[0].product_name}\nمبلغ: ${r.rows[0].price} تومان\nمشتری: ${msg.from.id}`,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "تأیید پرداخت", callback_data: `approve_${oid}` },
+          { text: "رد پرداخت", callback_data: `reject_${oid}` }
+        ]]
+      }
     });
-  } catch (error) {
-    console.error("Startup failed:", error.message);
-    process.exit(1);
+  } catch (e) {
+    console.error(e);
+    await bot.sendMessage(msg.chat.id, "خطا در دریافت رسید.");
   }
+});
+
+bot.on("message", async msg => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+
+  const id = msg.from.id;
+  const s = await sessionGet(id);
+  if (!s) return;
+
+  if (s.action === "setcard" && admin(id)) {
+    const card = msg.text.replace(/\s/g, "");
+    if (!/^\d{16}$/.test(card)) {
+      return bot.sendMessage(msg.chat.id, "شماره کارت باید ۱۶ رقم باشد.");
+    }
+
+    await db.query(
+      `INSERT INTO settings(key,value) VALUES('card_number',$1)
+       ON CONFLICT(key) DO UPDATE SET value=$1`, [card]
+    );
+    await sessionClear(id);
+    return bot.sendMessage(msg.chat.id, "شماره کارت ذخیره شد.");
+  }
+
+  if (s.action === "setprice" && admin(id)) {
+    const price = Number(msg.text.replace(/[,\s]/g, ""));
+    if (!Number.isSafeInteger(price) || price <= 0) {
+      return bot.sendMessage(msg.chat.id, "قیمت معتبر وارد کنید.");
+    }
+
+    await db.query("UPDATE products SET price=$1 WHERE id=$2",
+      [price, s.data.productId]
+    );
+    await sessionClear(id);
+    return bot.sendMessage(msg.chat.id, "قیمت تغییر کرد.");
+  }
+
+  if (s.action === "delivery" && admin(id)) {
+    const oid = s.data.orderId;
+    const r = await db.query(
+      `UPDATE orders SET delivery=$1,status='completed'
+       WHERE id=$2 AND status='awaiting_delivery' RETURNING user_id`,
+      [msg.text, oid]
+    );
+
+    await sessionClear(id);
+    if (!r.rows.length) return bot.sendMessage(msg.chat.id, "سفارش آماده تحویل نیست.");
+
+    await bot.sendMessage(r.rows[0].user_id,
+      `اطلاعات تحویل سفارش #${oid}:\n\n${msg.text}`
+    );
+    return bot.sendMessage(msg.chat.id, "اطلاعات تحویل ارسال شد.");
+  }
+});
+
+async function main() {
+  await initDB();
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => console.log("SHOP_UFO server running on " + port));
+  console.log("SHOP_UFO bot started");
 }
 
-start();
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
