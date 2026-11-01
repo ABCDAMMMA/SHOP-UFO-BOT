@@ -1,6 +1,7 @@
 
 const TelegramBot = require("node-telegram-bot-api");
 const { Pool } = require("pg");
+const express = require("express");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_CHAT_ID || "");
@@ -11,682 +12,968 @@ if (!TOKEN || !ADMIN_ID || !DATABASE_URL) {
 }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
-
-const db = new Pool({
+const app = express();
+const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5
+  ssl: { rejectUnauthorized: false }
 });
 
 const states = new Map();
 
-const mainMenu = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: "🛍 فروشگاه", callback_data: "shop" }],
-      [
-        { text: "🛒 سبد خرید", callback_data: "cart" },
-        { text: "📦 سفارش‌های من", callback_data: "myorders" }
-      ],
-      [
-        { text: "🎟 کد تخفیف", callback_data: "coupon" },
-        { text: "💬 پشتیبانی", callback_data: "support" }
-      ]
-    ]
-  }
-};
+const isAdmin = id => String(id) === ADMIN_ID;
+const money = n => Number(n).toLocaleString("en-US") + " تومان";
 
-function isAdmin(id) {
-  return String(id) === ADMIN_ID;
-}
+const kb = rows => ({ inline_keyboard: rows });
 
-function money(value) {
-  return Number(value).toLocaleString("en-US") + " تومان";
-}
-
-async function query(sql, params = []) {
-  return db.query(sql, params);
-}
-
-// ---------- DATABASE ----------
-
-async function initDB() {
-  await query(`
-    CREATE TABLE IF NOT EXISTS products (
-      id SERIAL PRIMARY KEY,
-      name TEXT,
-      category TEXT,
-      price BIGINT DEFAULT 0,
-      description TEXT DEFAULT '',
-      active BOOLEAN DEFAULT TRUE
-    )
-  `);
-
-  // Add missing columns without deleting existing product data.
-  await query(`
-    ALTER TABLE products
-    ADD COLUMN IF NOT EXISTS name TEXT,
-    ADD COLUMN IF NOT EXISTS category TEXT,
-    ADD COLUMN IF NOT EXISTS price BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '',
-    ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS ufo_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    )
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS ufo_cart (
-      id SERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      product_id INTEGER NOT NULL REFERENCES products(id),
-      quantity INTEGER NOT NULL DEFAULT 1,
-      UNIQUE(user_id, product_id)
-    )
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS ufo_coupons (
-      id SERIAL PRIMARY KEY,
-      code TEXT UNIQUE NOT NULL,
-      discount INTEGER NOT NULL,
-      max_uses INTEGER DEFAULT 100,
-      used_count INTEGER DEFAULT 0,
-      active BOOLEAN DEFAULT TRUE
-    )
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS ufo_orders (
-      id SERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      username TEXT,
-      total BIGINT NOT NULL,
-      status TEXT DEFAULT 'pending',
-      coupon TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS ufo_order_items (
-      id SERIAL PRIMARY KEY,
-      order_id INTEGER REFERENCES ufo_orders(id),
-      product_name TEXT,
-      price BIGINT,
-      quantity INTEGER
-    )
-  `);
-
-  await query(`
-    CREATE TABLE IF NOT EXISTS ufo_support (
-      id SERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      message TEXT,
-      status TEXT DEFAULT 'open',
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  await query(`
-    INSERT INTO ufo_settings(key, value)
-    VALUES ('card', 'اطلاعات کارت هنوز ثبت نشده است'),
-           ('welcome', 'به فروشگاه UFO خوش آمدید 👽')
-    ON CONFLICT (key) DO NOTHING
-  `);
-
-  console.log("SHOP UFO database initialized");
+async function query(sql, values = []) {
+  return pool.query(sql, values);
 }
 
 async function setting(key) {
-  const result = await query(
+  const r = await query(
     "SELECT value FROM ufo_settings WHERE key=$1",
     [key]
   );
-  return result.rows[0]?.value || "";
+  return r.rows[0]?.value || "";
 }
 
-async function setSetting(key, value) {
+async function saveSetting(key, value) {
   await query(`
     INSERT INTO ufo_settings(key,value)
     VALUES($1,$2)
-    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+    ON CONFLICT(key)
+    DO UPDATE SET value=EXCLUDED.value
   `, [key, value]);
 }
 
-// ---------- MENUS ----------
+async function initDB() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS ufo_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
 
-async function home(chatId) {
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      category TEXT NOT NULL,
+      name TEXT NOT NULL,
+      price BIGINT NOT NULL,
+      description TEXT DEFAULT '',
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    ALTER TABLE products
+      ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
+
+    CREATE TABLE IF NOT EXISTS ufo_cart (
+      user_id TEXT NOT NULL,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      quantity INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY(user_id, product_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ufo_coupons (
+      code TEXT PRIMARY KEY,
+      percent INTEGER NOT NULL,
+      max_uses INTEGER NOT NULL DEFAULT 0,
+      used_count INTEGER NOT NULL DEFAULT 0,
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS ufo_orders (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      username TEXT,
+      items JSONB NOT NULL,
+      total BIGINT NOT NULL,
+      discount BIGINT NOT NULL DEFAULT 0,
+      coupon TEXT,
+      status TEXT NOT NULL DEFAULT 'awaiting_receipt',
+      receipt_file_id TEXT,
+      delivery_text TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS ufo_support (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      username TEXT,
+      message TEXT NOT NULL,
+      status TEXT DEFAULT 'open',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  console.log("SHOP UFO V3 database ready");
+}
+
+function homeKeyboard(admin) {
+  const rows = [
+    [{ text: "🛍 فروشگاه", callback_data: "shop" }],
+    [
+      { text: "🛒 سبد خرید", callback_data: "cart" },
+      { text: "📦 سفارش‌ها", callback_data: "orders" }
+    ],
+    [
+      { text: "🎟 کد تخفیف", callback_data: "coupon" },
+      { text: "💬 پشتیبانی", callback_data: "support" }
+    ]
+  ];
+
+  if (admin) {
+    rows.push([
+      { text: "⚙️ مدیریت فروشگاه", callback_data: "admin" }
+    ]);
+  }
+
+  return kb(rows);
+}
+
+async function sendHome(chatId, userId) {
   const welcome = await setting("welcome");
+
   await bot.sendMessage(
     chatId,
-    welcome || "به فروشگاه UFO خوش آمدید 👽",
-    mainMenu
+    welcome || `🛸 به SHOP UFO خوش آمدید!
+
+✨ فروش خدمات مجازی
+⭐ استارز تلگرام
+🎁 گیفت تلگرام
+💎 خدمات ویژه
+
+از منوی زیر استفاده کنید.`,
+    { reply_markup: homeKeyboard(isAdmin(userId)) }
   );
 }
 
 async function showShop(chatId) {
-  const result = await query(`
-    SELECT DISTINCT category
-    FROM products
-    WHERE active=TRUE
-      AND category IS NOT NULL
-    ORDER BY category
+  const r = await query(`
+    SELECT DISTINCT category FROM products
+    WHERE active=TRUE ORDER BY category
   `);
 
-  if (!result.rows.length) {
-    return bot.sendMessage(chatId, "فعلاً محصولی در فروشگاه ثبت نشده است.");
+  if (!r.rows.length) {
+    return bot.sendMessage(chatId, "فعلاً محصولی موجود نیست.");
   }
 
-  const buttons = result.rows.map(row => [{
-    text: "📁 " + row.category,
-    callback_data: "cat:" + encodeURIComponent(row.category)
+  const rows = r.rows.map(x => [{
+    text: "📂 " + x.category,
+    callback_data: "cat:" + Buffer.from(x.category).toString("base64url")
   }]);
 
-  buttons.push([{ text: "🔙 بازگشت", callback_data: "home" }]);
+  rows.push([{ text: "🏠 منوی اصلی", callback_data: "home" }]);
 
-  await bot.sendMessage(chatId, "یک دسته‌بندی انتخاب کن:", {
-    reply_markup: { inline_keyboard: buttons }
+  await bot.sendMessage(chatId, "🛍 دسته‌بندی خدمات:", {
+    reply_markup: kb(rows)
   });
 }
 
 async function showProducts(chatId, category) {
-  const result = await query(
-    `SELECT id,name,price,description
-     FROM products
-     WHERE active=TRUE AND category=$1
-     ORDER BY id DESC`,
-    [category]
-  );
+  const r = await query(`
+    SELECT id,name,price,description
+    FROM products
+    WHERE category=$1 AND active=TRUE
+    ORDER BY id DESC
+  `, [category]);
 
-  if (!result.rows.length) {
+  if (!r.rows.length) {
     return bot.sendMessage(chatId, "محصولی در این دسته وجود ندارد.");
   }
 
-  for (const p of result.rows) {
-    await bot.sendMessage(
-      chatId,
-      `🛍 ${p.name}\n\n${p.description || "بدون توضیحات"}\n\n💰 قیمت: ${money(p.price)}`,
+  for (const p of r.rows) {
+    await bot.sendMessage(chatId,
+      `✨ ${p.name}\n\n${p.description || "بدون توضیحات"}\n\n💰 ${money(p.price)}`,
       {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "➕ افزودن به سبد", callback_data: "add:" + p.id }]
-          ]
-        }
+        reply_markup: kb([
+          [{ text: "➕ افزودن به سبد", callback_data: "add:" + p.id }],
+          [{ text: "🛒 مشاهده سبد", callback_data: "cart" }]
+        ])
       }
     );
   }
 }
 
+async function addToCart(userId, productId) {
+  const p = await query(
+    "SELECT id FROM products WHERE id=$1 AND active=TRUE",
+    [productId]
+  );
+
+  if (!p.rows.length) return false;
+
+  await query(`
+    INSERT INTO ufo_cart(user_id,product_id,quantity)
+    VALUES($1,$2,1)
+    ON CONFLICT(user_id,product_id)
+    DO UPDATE SET quantity=ufo_cart.quantity+1
+  `, [String(userId), productId]);
+
+  return true;
+}
+
 async function showCart(chatId, userId) {
-  const result = await query(`
-    SELECT c.product_id,c.quantity,p.name,p.price
+  const r = await query(`
+    SELECT p.id,p.name,p.price,c.quantity,
+           p.price*c.quantity AS subtotal
     FROM ufo_cart c
     JOIN products p ON p.id=c.product_id
-    WHERE c.user_id=$1
-  `, [userId]);
+    WHERE c.user_id=$1 AND p.active=TRUE
+    ORDER BY p.id
+  `, [String(userId)]);
 
-  if (!result.rows.length) {
-    return bot.sendMessage(chatId, "سبد خریدت خالیه 🛒");
+  if (!r.rows.length) {
+    return bot.sendMessage(chatId, "🛒 سبد خرید شما خالی است.", {
+      reply_markup: kb([
+        [{ text: "🛍 رفتن به فروشگاه", callback_data: "shop" }],
+        [{ text: "🏠 منوی اصلی", callback_data: "home" }]
+      ])
+    });
   }
 
   let total = 0;
-  let text = "🛒 سبد خرید شما:\n\n";
+  const rows = [];
 
-  for (const item of result.rows) {
-    const sum = Number(item.price) * item.quantity;
-    total += sum;
-    text += `• ${item.name} × ${item.quantity}\n${money(sum)}\n\n`;
+  for (const p of r.rows) {
+    total += Number(p.subtotal);
+
+    rows.push([{
+      text: `➖ ${p.name} (${p.quantity})`,
+      callback_data: "remove:" + p.id
+    }]);
   }
 
-  text += `💰 جمع کل: ${money(total)}`;
+  rows.push([{ text: "🎟 اعمال تخفیف", callback_data: "coupon" }]);
+  rows.push([{ text: "💳 ثبت سفارش", callback_data: "checkout" }]);
+  rows.push([{ text: "🗑 خالی کردن سبد", callback_data: "clearcart" }]);
+  rows.push([{ text: "🏠 منوی اصلی", callback_data: "home" }]);
 
-  await bot.sendMessage(chatId, text, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "💳 ثبت سفارش", callback_data: "checkout" }],
-        [{ text: "🗑 خالی کردن سبد", callback_data: "clearcart" }],
-        [{ text: "🔙 بازگشت", callback_data: "home" }]
-      ]
-    }
-  });
+  await bot.sendMessage(chatId,
+    `🛒 سبد خرید SHOP UFO\n\n` +
+    r.rows.map(p =>
+      `▪️ ${p.name} × ${p.quantity} = ${money(p.subtotal)}`
+    ).join("\n") +
+    `\n\n💰 مجموع: ${money(total)}`,
+    { reply_markup: kb(rows) }
+  );
 }
 
-// ---------- ORDERS ----------
+async function removeCartItem(userId, productId) {
+  await query(`
+    UPDATE ufo_cart
+    SET quantity=quantity-1
+    WHERE user_id=$1 AND product_id=$2 AND quantity>1
+  `, [String(userId), productId]);
 
-async function checkout(chatId, user) {
-  const result = await query(`
-    SELECT c.product_id,c.quantity,p.name,p.price
+  await query(`
+    DELETE FROM ufo_cart
+    WHERE user_id=$1 AND product_id=$2 AND quantity<=1
+  `, [String(userId), productId]);
+}
+
+async function calculateCart(userId) {
+  const r = await query(`
+    SELECT p.id,p.name,p.price,c.quantity,
+           p.price*c.quantity AS subtotal
     FROM ufo_cart c
     JOIN products p ON p.id=c.product_id
-    WHERE c.user_id=$1
-  `, [user.id]);
+    WHERE c.user_id=$1 AND p.active=TRUE
+  `, [String(userId)]);
 
-  if (!result.rows.length) {
+  return {
+    rows: r.rows,
+    total: r.rows.reduce(
+      (sum, p) => sum + Number(p.subtotal), 0
+    )
+  };
+}
+
+async function checkout(user, chatId) {
+  const cart = await calculateCart(user.id);
+
+  if (!cart.rows.length) {
     return bot.sendMessage(chatId, "سبد خرید خالی است.");
   }
 
-  let total = 0;
-  for (const item of result.rows) {
-    total += Number(item.price) * item.quantity;
+  const couponCode = states.get(String(user.id))?.coupon || null;
+  let discount = 0;
+
+  if (couponCode) {
+    const c = await query(`
+      SELECT * FROM ufo_coupons
+      WHERE code=$1 AND active=TRUE
+      FOR UPDATE
+    `, [couponCode]);
+
+    if (c.rows.length) {
+      const coupon = c.rows[0];
+
+      if (!coupon.max_uses ||
+          coupon.used_count < coupon.max_uses) {
+        discount = Math.floor(
+          cart.total * coupon.percent / 100
+        );
+      }
+    }
   }
 
-  const order = await query(`
-    INSERT INTO ufo_orders(user_id,username,total)
-    VALUES($1,$2,$3)
-    RETURNING id
-  `, [user.id, user.username || "", total]);
+  const total = cart.total - discount;
 
-  const orderId = order.rows[0].id;
+  const client = await pool.connect();
 
-  for (const item of result.rows) {
-    await query(`
-      INSERT INTO ufo_order_items(order_id,product_name,price,quantity)
-      VALUES($1,$2,$3,$4)
-    `, [orderId, item.name, item.price, item.quantity]);
+  try {
+    await client.query("BEGIN");
+
+    const order = await client.query(`
+      INSERT INTO ufo_orders
+      (user_id,username,items,total,discount,coupon)
+      VALUES($1,$2,$3,$4,$5,$6)
+      RETURNING *
+    `, [
+      String(user.id),
+      user.username || "",
+      JSON.stringify(cart.rows),
+      total,
+      discount,
+      couponCode
+    ]);
+
+    await client.query(
+      "DELETE FROM ufo_cart WHERE user_id=$1",
+      [String(user.id)]
+    );
+
+    if (couponCode && discount > 0) {
+      await client.query(`
+        UPDATE ufo_coupons
+        SET used_count=used_count+1
+        WHERE code=$1
+      `, [couponCode]);
+    }
+
+    await client.query("COMMIT");
+
+    states.delete(String(user.id));
+
+    const card = await setting("card");
+
+    await bot.sendMessage(chatId,
+      `✅ سفارش ثبت شد.
+
+🆔 شماره سفارش: #${order.rows[0].id}
+💰 مبلغ اولیه: ${money(cart.total)}
+🎟 تخفیف: ${money(discount)}
+💳 مبلغ نهایی: ${money(total)}
+
+${card ? "شماره کارت:\n" + card : "شماره کارت هنوز تنظیم نشده است."}
+
+پس از پرداخت، تصویر رسید را ارسال کنید.`,
+      {
+        reply_markup: kb([
+          [{ text: "📦 سفارش‌های من", callback_data: "orders" }],
+          [{ text: "🏠 منوی اصلی", callback_data: "home" }]
+        ])
+      }
+    );
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
   }
-
-  await query("DELETE FROM ufo_cart WHERE user_id=$1", [user.id]);
-
-  const card = await setting("card");
-
-  await bot.sendMessage(
-    chatId,
-    `✅ سفارش شماره ${orderId} ثبت شد.\n\n💰 مبلغ قابل پرداخت: ${money(total)}\n\n💳 اطلاعات پرداخت:\n${card}\n\nپس از پرداخت، تصویر رسید را همین‌جا ارسال کن.`
-  );
-
-  await query(
-    "UPDATE ufo_orders SET status='awaiting_receipt' WHERE id=$1",
-    [orderId]
-  );
 }
 
-// ---------- ADMIN ----------
+async function showOrders(chatId, userId) {
+  const r = await query(`
+    SELECT * FROM ufo_orders
+    WHERE user_id=$1 ORDER BY id DESC LIMIT 15
+  `, [String(userId)]);
 
-async function adminMenu(chatId) {
-  if (!isAdmin(chatId)) return;
+  if (!r.rows.length) {
+    return bot.sendMessage(chatId, "هنوز سفارشی ثبت نکرده‌اید.");
+  }
 
-  await bot.sendMessage(chatId, "⚙️ پنل مدیریت SHOP UFO", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "➕ افزودن محصول", callback_data: "admin_add" }],
-        [{ text: "📦 محصولات", callback_data: "admin_products" }],
-        [{ text: "🧾 سفارش‌ها", callback_data: "admin_orders" }],
-        [{ text: "📊 آمار", callback_data: "admin_stats" }],
-        [{ text: "💳 تغییر کارت", callback_data: "admin_card" }],
-        [{ text: "📝 تغییر پیام خوش‌آمد", callback_data: "admin_welcome" }]
-      ]
-    }
-  });
+  for (const o of r.rows) {
+    await bot.sendMessage(chatId,
+      `📦 سفارش #${o.id}\n` +
+      `💰 ${money(o.total)}\n` +
+      `📌 وضعیت: ${o.status}\n` +
+      (o.delivery_text ? `\n🚀 تحویل:\n${o.delivery_text}` : "")
+    );
+  }
+}
+
+function adminKeyboard() {
+  return kb([
+    [{ text: "➕ افزودن محصول", callback_data: "a:add" }],
+    [{ text: "📋 محصولات", callback_data: "a:products" }],
+    [{ text: "📦 سفارش‌های جدید", callback_data: "a:orders" }],
+    [{ text: "📊 آمار فروش", callback_data: "a:stats" }],
+    [{ text: "💳 تنظیم کارت", callback_data: "a:card" }],
+    [{ text: "🎟 ساخت تخفیف", callback_data: "a:coupon" }],
+    [{ text: "📝 پیام خوشامد", callback_data: "a:welcome" }],
+    [{ text: "💬 پیام‌های پشتیبانی", callback_data: "a:support" }],
+    [{ text: "🏠 منوی اصلی", callback_data: "home" }]
+  ]);
+}
+
+async function showAdmin(chatId, userId) {
+  if (!isAdmin(userId)) return;
+
+  await bot.sendMessage(chatId,
+    "⚙️ پنل مدیریت SHOP UFO\n\nیک بخش را انتخاب کنید:",
+    { reply_markup: adminKeyboard() }
+  );
 }
 
 async function adminProducts(chatId) {
-  const result = await query(
-    "SELECT id,name,price,active FROM products ORDER BY id DESC"
+  const r = await query(
+    "SELECT * FROM products ORDER BY id DESC LIMIT 40"
   );
 
-  if (!result.rows.length) {
+  if (!r.rows.length) {
     return bot.sendMessage(chatId, "محصولی ثبت نشده است.");
   }
 
-  for (const p of result.rows) {
-    await bot.sendMessage(
-      chatId,
-      `#${p.id} | ${p.name}\nقیمت: ${money(p.price)}\nوضعیت: ${p.active ? "فعال" : "غیرفعال"}`,
+  for (const p of r.rows) {
+    await bot.sendMessage(chatId,
+      `#${p.id} | ${p.name}\n` +
+      `دسته: ${p.category}\n` +
+      `قیمت: ${money(p.price)}\n` +
+      `وضعیت: ${p.active ? "فعال" : "غیرفعال"}`,
       {
-        reply_markup: {
-          inline_keyboard: [[
-            {
-              text: p.active ? "🔴 غیرفعال کردن" : "🟢 فعال کردن",
-              callback_data: "toggle:" + p.id
-            }
-          ]]
-        }
+        reply_markup: kb([
+          [{
+            text: "✏️ تغییر قیمت",
+            callback_data: "a:price:" + p.id
+          }],
+          [{
+            text: p.active ? "🔴 غیرفعال کردن" : "🟢 فعال کردن",
+            callback_data: "a:toggle:" + p.id
+          }]
+        ])
       }
     );
   }
 }
 
 async function adminOrders(chatId) {
-  const result = await query(`
-    SELECT id,user_id,username,total,status,created_at
-    FROM ufo_orders
-    ORDER BY id DESC
-    LIMIT 20
+  const r = await query(`
+    SELECT * FROM ufo_orders
+    WHERE status IN ('awaiting_receipt','paid')
+    ORDER BY id DESC LIMIT 20
   `);
 
-  if (!result.rows.length) {
-    return bot.sendMessage(chatId, "هنوز سفارشی ثبت نشده است.");
+  if (!r.rows.length) {
+    return bot.sendMessage(chatId, "سفارش بازی وجود ندارد.");
   }
 
-  for (const o of result.rows) {
-    await bot.sendMessage(
-      chatId,
-      `سفارش #${o.id}\nکاربر: ${o.username || o.user_id}\nمبلغ: ${money(o.total)}\nوضعیت: ${o.status}`,
+  for (const o of r.rows) {
+    const rows = [];
+
+    if (o.status === "paid") {
+      rows.push([{
+        text: "🚀 تحویل سفارش",
+        callback_data: "a:deliver:" + o.id
+      }]);
+    }
+
+    await bot.sendMessage(chatId,
+      `📦 سفارش #${o.id}\n` +
+      `👤 کاربر: ${o.username || o.user_id}\n` +
+      `💰 مبلغ: ${money(o.total)}\n` +
+      `📌 وضعیت: ${o.status}\n` +
+      `🧾 رسید: ${o.receipt_file_id ? "ارسال شده" : "هنوز ارسال نشده"}`,
       {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "✅ تأیید پرداخت", callback_data: "approve:" + o.id },
-            { text: "❌ رد پرداخت", callback_data: "reject:" + o.id }
-          ]]
-        }
+        reply_markup: kb([
+          ...(o.status === "awaiting_receipt" ? [[
+            { text: "✅ تأیید پرداخت", callback_data: "a:approve:" + o.id },
+            { text: "❌ رد پرداخت", callback_data: "a:reject:" + o.id }
+          ]] : []),
+          ...rows
+        ])
       }
     );
   }
 }
 
-// ---------- START ----------
+async function adminStats(chatId) {
+  const r = await query(`
+    SELECT
+      COUNT(*) AS orders,
+      COUNT(*) FILTER (WHERE status='paid' OR status='delivered') AS paid,
+      COUNT(*) FILTER (WHERE status='delivered') AS delivered,
+      COALESCE(SUM(total) FILTER
+        (WHERE status='paid' OR status='delivered'),0) AS revenue
+    FROM ufo_orders
+  `);
 
-bot.onText(/\/start/, async msg => {
-  try {
-    await home(msg.chat.id);
-  } catch (err) {
-    console.error("START ERROR:", err);
-    await bot.sendMessage(msg.chat.id, "مشکلی پیش آمد. لطفاً دوباره تلاش کن.");
+  const s = r.rows[0];
+
+  await bot.sendMessage(chatId,
+    `📊 آمار SHOP UFO\n\n` +
+    `📦 کل سفارش‌ها: ${s.orders}\n` +
+    `✅ پرداخت‌شده: ${s.paid}\n` +
+    `🚀 تحویل‌شده: ${s.delivered}\n` +
+    `💰 فروش تأییدشده: ${money(s.revenue)}`
+  );
+}
+
+async function processReceipt(msg) {
+  if (!msg.photo && !msg.document) return false;
+
+  const userId = String(msg.from.id);
+
+  const r = await query(`
+    SELECT * FROM ufo_orders
+    WHERE user_id=$1 AND status='awaiting_receipt'
+    ORDER BY id DESC LIMIT 1
+  `, [userId]);
+
+  if (!r.rows.length) return false;
+
+  const order = r.rows[0];
+
+  const fileId = msg.photo
+    ? msg.photo[msg.photo.length - 1].file_id
+    : msg.document.file_id;
+
+  await query(`
+    UPDATE ufo_orders
+    SET receipt_file_id=$2, updated_at=NOW()
+    WHERE id=$1
+  `, [order.id, fileId]);
+
+  await bot.sendMessage(msg.chat.id,
+    `📨 رسید سفارش #${order.id} ارسال شد.\nمنتظر بررسی مدیر باشید.`
+  );
+
+  const caption =
+    `🧾 رسید جدید\n\n` +
+    `سفارش: #${order.id}\n` +
+    `کاربر: ${msg.from.username || userId}\n` +
+    `مبلغ: ${money(order.total)}`;
+
+  const options = {
+    caption,
+    reply_markup: kb([[
+      { text: "✅ تأیید", callback_data: "a:approve:" + order.id },
+      { text: "❌ رد", callback_data: "a:reject:" + order.id }
+    ]])
+  };
+
+  if (msg.photo) {
+    await bot.sendPhoto(ADMIN_ID, fileId, options);
+  } else {
+    await bot.sendDocument(ADMIN_ID, fileId, options);
   }
-});
 
-bot.onText(/\/admin/, async msg => {
-  if (!isAdmin(msg.from.id)) return;
-  await adminMenu(msg.chat.id);
-});
+  return true;
+}
 
-// ---------- CALLBACKS ----------
+async function handleAdminAction(q, data) {
+  const chatId = q.message.chat.id;
+  const userId = q.from.id;
 
-bot.on("callback_query", async cq => {
-  const chatId = cq.message.chat.id;
-  const userId = cq.from.id;
-  const data = cq.data;
+  if (!isAdmin(userId)) return;
 
-  try {
-    await bot.answerCallbackQuery(cq.id);
-
-    if (data === "home") return home(chatId);
-    if (data === "shop") return showShop(chatId);
-    if (data === "cart") return showCart(chatId, userId);
-    if (data === "myorders") {
-      const r = await query(
-        "SELECT id,total,status FROM ufo_orders WHERE user_id=$1 ORDER BY id DESC LIMIT 10",
-        [userId]
-      );
-
-      if (!r.rows.length) {
-        return bot.sendMessage(chatId, "هنوز سفارشی ثبت نکردی.");
-      }
-
-      let t = "📦 سفارش‌های شما:\n\n";
-      for (const o of r.rows) {
-        t += `#${o.id} | ${money(o.total)} | ${o.status}\n`;
-      }
-      return bot.sendMessage(chatId, t);
-    }
-
-    if (data.startsWith("cat:")) {
-      return showProducts(chatId, decodeURIComponent(data.slice(4)));
-    }
-
-    if (data.startsWith("add:")) {
-      const id = Number(data.split(":")[1]);
-
-      await query(`
-        INSERT INTO ufo_cart(user_id,product_id,quantity)
-        VALUES($1,$2,1)
-        ON CONFLICT(user_id,product_id)
-        DO UPDATE SET quantity=ufo_cart.quantity+1
-      `, [userId, id]);
-
-      return bot.sendMessage(chatId, "✅ به سبد خرید اضافه شد.");
-    }
-
-    if (data === "clearcart") {
-      await query("DELETE FROM ufo_cart WHERE user_id=$1", [userId]);
-      return bot.sendMessage(chatId, "سبد خرید خالی شد.");
-    }
-
-    if (data === "checkout") {
-      return checkout(chatId, cq.from);
-    }
-
-    if (data === "coupon") {
-      states.set(userId, { type: "coupon" });
-      return bot.sendMessage(chatId, "کد تخفیف را ارسال کن:");
-    }
-
-    if (data === "support") {
-      states.set(userId, { type: "support" });
-      return bot.sendMessage(chatId, "پیامت را برای پشتیبانی ارسال کن:");
-    }
-
-    if (!isAdmin(userId)) return;
-
-    if (data === "admin_add") {
-      states.set(userId, { type: "add_name" });
-      return bot.sendMessage(chatId, "نام محصول را ارسال کن:");
-    }
-
-    if (data === "admin_products") return adminProducts(chatId);
-    if (data === "admin_orders") return adminOrders(chatId);
-
-    if (data === "admin_stats") {
-      const r = await query(`
-        SELECT COUNT(*) AS orders,
-               COALESCE(SUM(total),0) AS revenue
-        FROM ufo_orders
-        WHERE status='approved'
-      `);
-
-      return bot.sendMessage(
-        chatId,
-        `📊 آمار فروش\nتعداد سفارش تأییدشده: ${r.rows[0].orders}\nمجموع فروش تأییدشده: ${money(r.rows[0].revenue)}`
-      );
-    }
-
-    if (data === "admin_card") {
-      states.set(userId, { type: "card" });
-      return bot.sendMessage(chatId, "اطلاعات کارت جدید را ارسال کن:");
-    }
-
-    if (data === "admin_welcome") {
-      states.set(userId, { type: "welcome" });
-      return bot.sendMessage(chatId, "متن خوش‌آمدگویی جدید را ارسال کن:");
-    }
-
-    if (data.startsWith("toggle:")) {
-      const id = Number(data.split(":")[1]);
-      await query(
-        "UPDATE products SET active=NOT active WHERE id=$1",
-        [id]
-      );
-      return bot.sendMessage(chatId, "وضعیت محصول تغییر کرد.");
-    }
-
-    if (data.startsWith("approve:")) {
-      const id = Number(data.split(":")[1]);
-      const r = await query(
-        "UPDATE ufo_orders SET status='approved' WHERE id=$1 RETURNING user_id",
-        [id]
-      );
-
-      if (r.rows[0]) {
-        await bot.sendMessage(r.rows[0].user_id, `✅ پرداخت سفارش #${id} تأیید شد.`);
-      }
-      return bot.sendMessage(chatId, "سفارش تأیید شد.");
-    }
-
-    if (data.startsWith("reject:")) {
-      const id = Number(data.split(":")[1]);
-      const r = await query(
-        "UPDATE ufo_orders SET status='rejected' WHERE id=$1 RETURNING user_id",
-        [id]
-      );
-
-      if (r.rows[0]) {
-        await bot.sendMessage(r.rows[0].user_id, `❌ پرداخت سفارش #${id} تأیید نشد. برای پیگیری با پشتیبانی تماس بگیر.`);
-      }
-      return bot.sendMessage(chatId, "سفارش رد شد.");
-    }
-
-  } catch (err) {
-    console.error("CALLBACK ERROR:", data, err);
-    try {
-      await bot.sendMessage(chatId, "خطایی رخ داد. لطفاً دوباره تلاش کن.");
-    } catch (_) {}
+  if (data === "a:add") {
+    states.set(String(userId), { type: "add" });
+    return bot.sendMessage(chatId,
+      "اطلاعات محصول را با این قالب ارسال کنید:\n\nدسته|نام|قیمت|توضیحات\n\nمثال:\nStars|100 استارز|150000|تحویل سریع"
+    );
   }
-});
 
-// ---------- USER MESSAGES ----------
+  if (data === "a:products") return adminProducts(chatId);
+  if (data === "a:orders") return adminOrders(chatId);
+  if (data === "a:stats") return adminStats(chatId);
 
-bot.on("message", async msg => {
-  if (!msg.text || msg.text.startsWith("/")) return;
+  if (data === "a:card") {
+    states.set(String(userId), { type: "card" });
+    return bot.sendMessage(chatId, "شماره کارت و نام صاحب حساب را ارسال کنید.");
+  }
 
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-  const state = states.get(userId);
+  if (data === "a:coupon") {
+    states.set(String(userId), { type: "coupon" });
+    return bot.sendMessage(chatId,
+      "قالب ساخت کد تخفیف:\nCODE|درصد|حداکثر استفاده\n\nمثال:\nUFO20|20|100\n\nبرای استفاده نامحدود عدد 0 وارد کنید."
+    );
+  }
 
-  try {
-    if (msg.photo) {
-      const r = await query(`
-        SELECT id FROM ufo_orders
-        WHERE user_id=$1 AND status='awaiting_receipt'
-        ORDER BY id DESC LIMIT 1
-      `, [userId]);
+  if (data === "a:welcome") {
+    states.set(String(userId), { type: "welcome" });
+    return bot.sendMessage(chatId, "متن پیام خوشامدگویی جدید را ارسال کنید.");
+  }
 
-      if (!r.rows.length) return;
+  if (data === "a:support") {
+    const r = await query(`
+      SELECT * FROM ufo_support
+      WHERE status='open' ORDER BY id DESC LIMIT 15
+    `);
 
-      const orderId = r.rows[0].id;
-      const photo = msg.photo[msg.photo.length - 1].file_id;
+    if (!r.rows.length) {
+      return bot.sendMessage(chatId, "پیام پشتیبانی بازی وجود ندارد.");
+    }
 
-      await bot.sendPhoto(ADMIN_ID, photo, {
-        caption: `🧾 رسید سفارش #${orderId}\nکاربر: ${msg.from.username || userId}`,
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "✅ تأیید", callback_data: "approve:" + orderId },
-            { text: "❌ رد", callback_data: "reject:" + orderId }
-          ]]
+    for (const s of r.rows) {
+      await bot.sendMessage(chatId,
+        `🎫 تیکت #${s.id}\nکاربر: ${s.username || s.user_id}\n\n${s.message}`,
+        {
+          reply_markup: kb([[
+            { text: "✉️ پاسخ به کاربر", callback_data: "a:reply:" + s.id }
+          ]])
         }
-      });
-
-      return bot.sendMessage(chatId, "رسیدت برای بررسی ارسال شد.");
-    }
-
-    if (!state) return;
-
-    if (state.type === "card") {
-      await setSetting("card", msg.text);
-      states.delete(userId);
-      return bot.sendMessage(chatId, "اطلاعات کارت ذخیره شد.");
-    }
-
-    if (state.type === "welcome") {
-      await setSetting("welcome", msg.text);
-      states.delete(userId);
-      return bot.sendMessage(chatId, "پیام خوش‌آمدگویی تغییر کرد.");
-    }
-
-    if (state.type === "coupon") {
-      const r = await query(`
-        SELECT * FROM ufo_coupons
-        WHERE UPPER(code)=UPPER($1)
-          AND active=TRUE
-          AND used_count < max_uses
-      `, [msg.text.trim()]);
-
-      states.delete(userId);
-
-      if (!r.rows.length) {
-        return bot.sendMessage(chatId, "کد تخفیف معتبر نیست یا ظرفیت استفاده‌اش تمام شده.");
-      }
-
-      return bot.sendMessage(
-        chatId,
-        `کد تخفیف معتبر است: ${r.rows[0].discount}%\nبرای اعمال تخفیف، فعلاً با پشتیبانی هماهنگ کن.`
       );
     }
 
-    if (state.type === "support") {
-      await query(
-        "INSERT INTO ufo_support(user_id,message) VALUES($1,$2)",
-        [userId, msg.text]
-      );
-
-      states.delete(userId);
-      await bot.sendMessage(chatId, "پیامت برای پشتیبانی ثبت شد.");
-
-      return bot.sendMessage(
-        ADMIN_ID,
-        `💬 پیام پشتیبانی جدید\nکاربر: ${msg.from.username || userId}\n\n${msg.text}`
-      );
-    }
-
-    if (state.type === "add_name") {
-      states.set(userId, { type: "add_category", name: msg.text });
-      return bot.sendMessage(chatId, "دسته‌بندی محصول را ارسال کن:");
-    }
-
-    if (state.type === "add_category") {
-      states.set(userId, {
-        type: "add_price",
-        name: state.name,
-        category: msg.text
-      });
-      return bot.sendMessage(chatId, "قیمت محصول را فقط به عدد تومان ارسال کن:");
-    }
-
-    if (state.type === "add_price") {
-      const price = Number(msg.text.replace(/[^\d]/g, ""));
-
-      if (!Number.isSafeInteger(price) || price <= 0) {
-        return bot.sendMessage(chatId, "قیمت معتبر نیست. دوباره عدد قیمت را ارسال کن:");
-      }
-
-      states.set(userId, {
-        type: "add_description",
-        name: state.name,
-        category: state.category,
-        price
-      });
-
-      return bot.sendMessage(chatId, "توضیحات محصول را ارسال کن:");
-    }
-
-    if (state.type === "add_description") {
-      await query(`
-        INSERT INTO products(name,category,price,description,active)
-        VALUES($1,$2,$3,$4,TRUE)
-      `, [state.name, state.category, state.price, msg.text]);
-
-      states.delete(userId);
-      return bot.sendMessage(chatId, "✅ محصول با موفقیت ثبت شد.");
-    }
-
-  } catch (err) {
-    console.error("MESSAGE ERROR:", err);
-    await bot.sendMessage(chatId, "خطایی رخ داد. لطفاً دوباره تلاش کن.");
+    return;
   }
-});
 
-// ---------- ERROR HANDLING ----------
+  const parts = data.split(":");
 
-bot.on("polling_error", err => {
-  console.error("POLLING ERROR:", err.message);
-});
+  if (parts[1] === "price") {
+    states.set(String(userId), {
+      type: "price",
+      productId: Number(parts[2])
+    });
+    return bot.sendMessage(chatId, "قیمت جدید را به تومان ارسال کنید.");
+  }
 
-process.on("unhandledRejection", err => {
-  console.error("UNHANDLED REJECTION:", err);
-});
+  if (parts[1] === "toggle") {
+    const id = Number(parts[2]);
 
-async function start() {
-  try {
-    await initDB();
-    console.log("👽 SHOP UFO V4 is running");
-  } catch (err) {
-    console.error("DATABASE START ERROR:", err);
-    process.exit(1);
+    await query(`
+      UPDATE products SET active=NOT active WHERE id=$1
+    `, [id]);
+
+    return bot.sendMessage(chatId, "وضعیت محصول تغییر کرد.");
+  }
+
+  if (parts[1] === "approve" || parts[1] === "reject") {
+    const id = Number(parts[2]);
+    const status = parts[1] === "approve" ? "paid" : "rejected";
+
+    const r = await query(`
+      UPDATE ufo_orders
+      SET status=$2, updated_at=NOW()
+      WHERE id=$1 AND status='awaiting_receipt'
+      RETURNING *
+    `, [id, status]);
+
+    if (!r.rows.length) {
+      return bot.sendMessage(chatId, "این سفارش قبلاً بررسی شده است.");
+    }
+
+    const o = r.rows[0];
+
+    await bot.sendMessage(o.user_id,
+      status === "paid"
+        ? `✅ پرداخت سفارش #${id} تأیید شد.\nسفارش در انتظار تحویل است.`
+        : `❌ پرداخت سفارش #${id} تأیید نشد. با پشتیبانی تماس بگیرید.`
+    );
+
+    return bot.sendMessage(chatId, "وضعیت سفارش به‌روزرسانی شد.");
+  }
+
+  if (parts[1] === "deliver") {
+    states.set(String(userId), {
+      type: "deliver",
+      orderId: Number(parts[2])
+    });
+    return bot.sendMessage(chatId,
+      "متن یا اطلاعات تحویل سفارش را ارسال کنید."
+    );
+  }
+
+  if (parts[1] === "reply") {
+    states.set(String(userId), {
+      type: "reply",
+      ticketId: Number(parts[2])
+    });
+    return bot.sendMessage(chatId, "متن پاسخ را ارسال کنید.");
   }
 }
 
-start();
+async function handleState(msg) {
+  const userId = String(msg.from.id);
+  const state = states.get(userId);
+
+  if (!state || !msg.text) return false;
+
+  const text = msg.text.trim();
+
+  if (state.type === "add" && isAdmin(msg.from.id)) {
+    const p = text.split("|").map(x => x.trim());
+    const price = Number(p[2]);
+
+    if (p.length < 3 || !p[0] || !p[1] ||
+        !Number.isSafeInteger(price) || price <= 0) {
+      await bot.sendMessage(msg.chat.id, "اطلاعات نامعتبر است. دوباره ارسال کنید.");
+      return true;
+    }
+
+    await query(`
+      INSERT INTO products(category,name,price,description)
+      VALUES($1,$2,$3,$4)
+    `, [p[0], p[1], price, p[3] || ""]);
+
+    states.delete(userId);
+    await bot.sendMessage(msg.chat.id, "✅ محصول ثبت شد.");
+    return true;
+  }
+
+  if (state.type === "card" && isAdmin(msg.from.id)) {
+    await saveSetting("card", text);
+    states.delete(userId);
+    await bot.sendMessage(msg.chat.id, "✅ اطلاعات کارت ذخیره شد.");
+    return true;
+  }
+
+  if (state.type === "welcome" && isAdmin(msg.from.id)) {
+    await saveSetting("welcome", text);
+    states.delete(userId);
+    await bot.sendMessage(msg.chat.id, "✅ پیام خوشامد ذخیره شد.");
+    return true;
+  }
+
+  if (state.type === "price" && isAdmin(msg.from.id)) {
+    const price = Number(text);
+
+    if (!Number.isSafeInteger(price) || price <= 0) {
+      await bot.sendMessage(msg.chat.id, "قیمت معتبر وارد کنید.");
+      return true;
+    }
+
+    await query(
+      "UPDATE products SET price=$1 WHERE id=$2",
+      [price, state.productId]
+    );
+
+    states.delete(userId);
+    await bot.sendMessage(msg.chat.id, "✅ قیمت تغییر کرد.");
+    return true;
+  }
+
+  if (state.type === "coupon" && isAdmin(msg.from.id)) {
+    const p = text.split("|").map(x => x.trim());
+    const percent = Number(p[1]);
+    const max = Number(p[2]);
+
+    if (!p[0] || !Number.isInteger(percent) ||
+        percent < 1 || percent > 100 ||
+        !Number.isInteger(max) || max < 0) {
+      await bot.sendMessage(msg.chat.id, "قالب کد تخفیف نامعتبر است.");
+      return true;
+    }
+
+    await query(`
+      INSERT INTO ufo_coupons(code,percent,max_uses)
+      VALUES($1,$2,$3)
+      ON CONFLICT(code)
+      DO UPDATE SET percent=EXCLUDED.percent,
+        max_uses=EXCLUDED.max_uses,
+        active=TRUE
+    `, [p[0].toUpperCase(), percent, max]);
+
+    states.delete(userId);
+    await bot.sendMessage(msg.chat.id, "✅ کد تخفیف ساخته شد.");
+    return true;
+  }
+
+  if (state.type === "deliver" && isAdmin(msg.from.id)) {
+    const r = await query(`
+      UPDATE ufo_orders
+      SET status='delivered',
+          delivery_text=$2,
+          updated_at=NOW()
+      WHERE id=$1 AND status='paid'
+      RETURNING *
+    `, [state.orderId, text]);
+
+    states.delete(userId);
+
+    if (!r.rows.length) {
+      await bot.sendMessage(msg.chat.id,
+        "سفارش پیدا نشد یا پرداخت آن تأیید نشده است."
+      );
+      return true;
+    }
+
+    await bot.sendMessage(r.rows[0].user_id,
+      `🎉 سفارش #${state.orderId} تحویل داده شد!\n\n${text}`
+    );
+
+    await bot.sendMessage(msg.chat.id, "✅ تحویل انجام شد.");
+    return true;
+  }
+
+  if (state.type === "reply" && isAdmin(msg.from.id)) {
+    const r = await query(
+      "SELECT * FROM ufo_support WHERE id=$1",
+      [state.ticketId]
+    );
+
+    states.delete(userId);
+
+    if (!r.rows.length) return true;
+
+    await bot.sendMessage(r.rows[0].user_id,
+      `💬 پاسخ پشتیبانی SHOP UFO:\n\n${text}`
+    );
+
+    await query(
+      "UPDATE ufo_support SET status='answered' WHERE id=$1",
+      [state.ticketId]
+    );
+
+    await bot.sendMessage(msg.chat.id, "✅ پاسخ ارسال شد.");
+    return true;
+  }
+
+  if (state.type === "coupon") {
+    const code = text.toUpperCase();
+
+    const r = await query(`
+      SELECT * FROM ufo_coupons
+      WHERE code=$1 AND active=TRUE
+    `, [code]);
+
+    if (!r.rows.length ||
+        (r.rows[0].max_uses > 0 &&
+         r.rows[0].used_count >= r.rows[0].max_uses)) {
+      await bot.sendMessage(msg.chat.id, "❌ کد تخفیف نامعتبر یا تمام‌شده است.");
+      return true;
+    }
+
+    states.set(userId, { coupon: code });
+    await bot.sendMessage(msg.chat.id,
+      `✅ کد ${code} ثبت شد.\nحالا سبد خرید را باز کنید و سفارش دهید.`,
+      {
+        reply_markup: kb([
+          [{ text: "🛒 مشاهده سبد خرید", callback_data: "cart" }]
+        ])
+      }
+    );
+
+    return true;
+  }
+
+  if (state.type === "support") {
+    const r = await query(`
+      INSERT INTO ufo_support(user_id,username,message)
+      VALUES($1,$2,$3) RETURNING id
+    `, [userId, msg.from.username || "", text]);
+
+    states.delete(userId);
+
+    await bot.sendMessage(msg.chat.id,
+      `✅ پیام شما ثبت شد.\nشماره تیکت: #${r.rows[0].id}`
+    );
+
+    await bot.sendMessage(ADMIN_ID,
+      `💬 پیام پشتیبانی جدید\nتیکت: #${r.rows[0].id}\nکاربر: ${msg.from.username || userId}\n\n${text}`
+    );
+
+    return true;
+  }
+
+  return false;
+}
+
+bot.on("callback_query", async q => {
+  const data = q.data;
+  const chatId = q.message.chat.id;
+  const userId = q.from.id;
+
+  try {
+    if (data === "home") {
+      await sendHome(chatId, userId);
+    } else if (data === "shop") {
+      await showShop(chatId);
+    } else if (data === "cart") {
+      await showCart(chatId, userId);
+    } else if (data === "orders") {
+      await showOrders(chatId, userId);
+    } else if (data === "admin") {
+      await showAdmin(chatId, userId);
+    } else if (data === "coupon") {
+      states.set(String(userId), { type: "coupon" });
+      await bot.sendMessage(chatId, "کد تخفیف خود را ارسال کنید.");
+    } else if (data === "support") {
+      states.set(String(userId), { type: "support" });
+      await bot.sendMessage(chatId, "پیام خود را برای پشتیبانی ارسال کنید.");
+    } else if (data === "checkout") {
+      await checkout(q.from, chatId);
+    } else if (data === "clearcart") {
+      await query(
+        "DELETE FROM ufo_cart WHERE user_id=$1",
+        [String(userId)]
+      );
+      await bot.sendMessage(chatId, "🗑 سبد خرید خالی شد.");
+    } else if (data.startsWith("cat:")) {
+      const category = Buffer.from(
+        data.slice(4), "base64url"
+      ).toString("utf8");
+
+      await showProducts(chatId, category);
+    } else if (data.startsWith("add:")) {
+      const ok = await addToCart(userId, Number(data.slice(4)));
+      await bot.sendMessage(chatId,
+        ok ? "✅ به سبد خرید اضافه شد." : "این محصول دیگر فعال نیست."
+      );
+    } else if (data.startsWith("remove:")) {
+      await removeCartItem(userId, Number(data.slice(7)));
+      await showCart(chatId, userId);
+    } else if (data.startsWith("a:")) {
+      await handleAdminAction(q, data);
+    }
+  } catch (e) {
+    console.error("Callback error:", e);
+    await bot.sendMessage(chatId, "خطایی رخ داد. دوباره تلاش کنید.");
+  }
+
+  await bot.answerCallbackQuery(q.id).catch(() => {});
+});
+
+bot.on("message", async msg => {
+  if (msg.text?.startsWith("/start")) {
+    states.delete(String(msg.from.id));
+    return sendHome(msg.chat.id, msg.from.id);
+  }
+
+  try {
+    if (msg.text && await handleState(msg)) return;
+
+    if (msg.photo || msg.document) {
+      await processReceipt(msg);
+    }
+  } catch (e) {
+    console.error("Message error:", e);
+    await bot.sendMessage(msg.chat.id, "خطایی رخ داد.");
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send("SHOP UFO V3 ONLINE");
+});
+
+const PORT = process.env.PORT || 3000;
+
+async function start() {
+  await initDB();
+
+  app.listen(PORT, () => {
+    console.log("SHOP UFO V3 running on port " + PORT);
+  });
+}
+
+start().catch(e => {
+  console.error("Startup error:", e);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", error => {
+  console.error("Unhandled rejection:", error);
+});
