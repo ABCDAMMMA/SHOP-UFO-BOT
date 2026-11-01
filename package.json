@@ -1,0 +1,13 @@
+{
+  "name": "shop-ufo-bot",
+  "version": "1.0.0",
+  "description": "SHOP UFO Telegram Store Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
